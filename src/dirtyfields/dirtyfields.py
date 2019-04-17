@@ -64,9 +64,11 @@ class DirtyFieldsMixin(object):
 
     FIELDS_TO_CHECK = None
 
+    DISABLE_DIRTYFIELDS = False
+
     def __init__(self, *args, **kwargs):
         # Get the flag to know whether to disable dirtyfields
-        self._dirtyfields_disabled = kwargs.pop('disable_dirtyfields', False)
+        self._dirtyfields_disabled = kwargs.pop('disable_dirtyfields', self.DISABLE_DIRTYFIELDS)
 
         super(DirtyFieldsMixin, self).__init__(*args, **kwargs)
 
