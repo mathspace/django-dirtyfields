@@ -1,0 +1,64 @@
+# django-dirtyfields threat model
+
+## Overview
+
+An in-process Django model mixin snapshots model values and compares them with later in-memory state. It supports selective update_fields saves, optional M2M comparisons, and a queryset path that disables tracking. It owns no HTTP endpoint, user identity or separate storage service (src/dirtyfields/dirtyfields.py:25; src/dirtyfields/dirtyfields.py:57; src/dirtyfields/dirtyfields.py:222).
+
+The library runs with the same authority as the host Django model. A caller can inspect dirty values, ask whether an instance changed, or save the changed fields. It does not expose a listener, issue credentials, install a tenant model or create an independent audit store. Querysets and model initialization determine whether tracking is active, so consumers must handle disabled tracking as an explicit API state. Security relevance arises when a host uses these results for persistence decisions or sends them to a less-trusted recipient.
+
+| Component | Source |
+| --- | --- |
+| Mixin snapshot and comparison | src/dirtyfields/dirtyfields.py:57; src/dirtyfields/dirtyfields.py:184 |
+| Optional queryset and M2M paths | src/dirtyfields/dirtyfields.py:25; src/dirtyfields/dirtyfields.py:112 |
+| Selective persistence and baseline reset | src/dirtyfields/dirtyfields.py:222; src/dirtyfields/dirtyfields.py:227 |
+| Package boundary | setup.py:8 |
+
+| Deployment or workflow | Resource or capability | Configuration and precedence | Safe effective value or location | Readers, writers, or recipients | Enforcing control | Evidence or unknowns |
+| --- | --- | --- | --- | --- | --- | --- |
+| Library embedded in Django | State snapshot | Model initialization/post_save/refresh → reset_state → selected nondeferred field deep copies | instance._original_state and optional _original_m2m_state in process memory | Caller holding model/diff objects | Model field selection and caller memory/log controls | src/dirtyfields/dirtyfields.py:247 |
+| Library embedded in Django | Selective save | get_dirty_fields(check_relationship=True) → model.save(update_fields=keys) → host ORM routing | Host model table and host Django DB routing via self.save(update_fields=dirty_fields.keys()) | Host DB and model signal receivers | Caller authorization, model save and DB transaction policy | src/dirtyfields/dirtyfields.py:222 |
+
+## Threat Model, Trust Boundaries, and Assumptions
+
+**Protected assets.** Original and current field values held in process memory, possibly confidential when models contain personal data (src/dirtyfields/dirtyfields.py:165). Correct selective persistence of caller-owned model fields and model baseline lifecycle (src/dirtyfields/dirtyfields.py:222; src/dirtyfields/dirtyfields.py:227).
+
+**Actors and starting authority.** Untrusted input can affect model values only through a host integration; the library does not grant outsiders an object reference or mutation authority. A caller controlling normalization/comparison functions already supplies executable application code.
+
+**Trust boundaries and owned controls.**
+
+- Trusted model construction connects post_save and optionally m2m_changed; reset_state refreshes local baselines. Queryset disable flag is a performance/control choice, not a permission boundary (src/dirtyfields/dirtyfields.py:69; src/dirtyfields/dirtyfields.py:40).
+- Fields are filtered by FIELDS_TO_CHECK, deferred and expression values are skipped, values are converted and deep-copied. Configured compare/normalise functions execute with caller process authority (src/dirtyfields/dirtyfields.py:58; src/dirtyfields/dirtyfields.py:121).
+- get_dirty_fields returns saved values by default or saved/current pairs in verbose mode; callers decide whether those values reach logs, APIs or telemetry. save_dirty_fields delegates to self.save(update_fields=...), so model authorization and transactions remain host responsibilities (src/dirtyfields/dirtyfields.py:184; src/dirtyfields/dirtyfields.py:222).
+
+**Security objectives.** Authorize assignment/persistence before invoking selective saves. Protect returned baselines and verbose diffs as sensitive model data. Do not use dirty state as a substitute for concurrency control, database truth or an audit ledger.
+
+**Assumptions and unresolved controls.**
+
+- Snapshots reflect instance lifecycle; concurrent external updates and transaction rollback semantics require caller design, not an inferred lock or transaction guarantee (src/dirtyfields/dirtyfields.py:227).
+- Packaging uses setuptools for django-dirtyfields 1.3.1; no release workflow appears in inventory; package publisher controls are unknown (setup.py:8).
+- No database endpoint, business transition policy, audit integration or log collector is supplied. M2M checks default off, relationship comparisons are optional, and deferred/expression values may be omitted; review a real consumer before assigning impact to those choices.
+
+## Attack Surface, Mitigations, and Attacker Stories
+
+These are prioritized hypotheses, not validated vulnerabilities. Each requires its stated caller, data and exposure prerequisites; ordinary use of authority already granted is not a new capability.
+
+| Priority | Scenario and capability gain | Prerequisites | Impact | Existing controls | Mitigation | Evidence |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | A host returns a dirty-field dictionary to a reader who may see current data but not prior sensitive values. | The integration exposes get_dirty_fields output without history-equivalent authorization. | Disclosure of saved values, including values overwritten in memory. | Caller chooses fields and verbose mode; no independent outbound recipient exists. | Authorize and minimize returned diffs; treat snapshots as historical data. | src/dirtyfields/dirtyfields.py:184; src/dirtyfields/dirtyfields.py:210 |
+| 2 | A user changes a security-sensitive field and a host mistakes selective saving for permission to persist that field. | Host accepts the assignment and relies on dirty membership instead of field/object authorization. | Unauthorized business-state change using the host DB authority. | self.save receives explicit update_fields; host models and database controls still apply. | Authorize assignments and allowed transitions before invoking save_dirty_fields. | src/dirtyfields/dirtyfields.py:222 |
+| 2 | A host uses a stale, partial or reset baseline as proof of database truth or a concurrency guard. | A real protected invariant depends on concurrent writers, transaction rollback, deferred fields or omitted expressions. | Lost/incorrect state decisions or incomplete security accounting in the host. | Baseline resets on model lifecycle; field/deferred/expression selection is explicit. | Use database transaction/locking or version rules for shared-state invariants; reserve dirty state for its documented instance role. | src/dirtyfields/dirtyfields.py:137; src/dirtyfields/dirtyfields.py:142; src/dirtyfields/dirtyfields.py:227 |
+| 3 | An integration lets an untrusted caller choose comparison/normalization functions or packaged code. | A demonstrated lower-trust configuration-to-code boundary; ordinary model values cannot select functions. | Execution under host Python authority. | Callables are model class configuration, not a public request interface. | Keep function and package selection under trusted developer/release control. | src/dirtyfields/dirtyfields.py:58; src/dirtyfields/dirtyfields.py:198; setup.py:8 |
+
+## Severity Calibration (Critical, High, Medium, Low)
+
+| Level | Repository-specific example | Counterexample or limiting prerequisite |
+| --- | --- | --- |
+| Critical | A demonstrated host integration turns lower-trust callable/package selection into broad privileged code execution. | The repository supplies no remote callable-selection API; ordinary trusted Python customization is not a critical vulnerability. |
+| High | A real host bypass permits unauthorized sensitive state changes or disclosure of another user’s confidential baseline. | Requires the host authorization boundary and concrete impact, not just detection of a changed field. |
+| Medium | A supported caller workflow loses meaningful consistency or confidentiality because it misuses partial instance state. | Concurrency/transaction and data prerequisites must be shown; no general audit or lock guarantee is established. |
+| Low | An isolated caller receives an unexpected dirty result or disabled-state error without shared-state or confidentiality impact. | Developer debugging and authorized local inspection of model values are expected behavior. |
+
+This model uses an independent source-backed architecture pass. Repository citations were checked against the supplied inventory and source lines; application code and external services were not executed. Source-established behavior is distinct from unverified deployment exposure. Revisit the model when the described input, storage, authorization or publication boundaries change.
+
+Repository: github.com/mathspace/django-dirtyfields
+Version: c325363a29b3bf73cf54dea7f3831d8132db0307
